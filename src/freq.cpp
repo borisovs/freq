@@ -2,12 +2,18 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
-#include <future>
+#include <iostream>
 //-----------------------------------------------------------------------------
 #include "freq.h"
 #include "exceptions.h"
 //-----------------------------------------------------------------------------
 namespace Logic {
+//-----------------------------------------------------------------------------
+
+static void PrintElapsedime(const char* func, long count)
+{
+    std::cout << std::setw(10) << func <<":\t" << count << " ms" << std::endl;
+}
 //-----------------------------------------------------------------------------
 
 Freq::Freq(const std::string& aInputFile, const std::string& aOutputFile)
@@ -21,132 +27,108 @@ Freq::Freq(const std::string& aInputFile, const std::string& aOutputFile)
 
 bool Freq::Run()
 {
-    auto vec = ConvertToVector( FormatString( ReadData() ));
-    auto calcData = CalculateTokensFreq(std::move(vec));
-    auto sortedData = SortOutputData(std::move(calcData));
-    WriteData(std::move(sortedData));
+    auto before = std::chrono::high_resolution_clock::now();
+    auto data = ReadData();
+    PrintElapsedime("ReadData", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - before).count());
+
+    before = std::chrono::high_resolution_clock::now();
+    auto rootNode = BuildTrie(std::move(data));
+    PrintElapsedime("BuildTrie", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - before).count());
+
+    before = std::chrono::high_resolution_clock::now();
+    TraceTrie(rootNode.get());
+    PrintElapsedime("TraceTrie", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - before).count());
+
+    before = std::chrono::high_resolution_clock::now();
+    WriteTrie();
+    PrintElapsedime("WriteTrie", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - before).count());
+
     return true;
 }
 //-----------------------------------------------------------------------------
 
-std::string Freq::ReadData() const
+std::vector<char> Freq::ReadData() const
 {
-    std::string buf;
-    buf.resize(fs::file_size(m_inpath));
-
     std::ifstream ifs(m_inpath.string(), std::ifstream::binary);
     if(!ifs.is_open())
         throw Error::OpenFileException(m_inpath.string());
 
-    ifs.read(&buf[0], buf.size());
+    auto fileSize = fs::file_size(m_inpath);
+    std::vector<char> buf(fileSize);
+
+    ifs.read(buf.data(), fileSize);
     return buf;
 }
 //-----------------------------------------------------------------------------
 
-std::string Freq::FormatString(std::string&& aData) const
+std::unique_ptr<Freq::TrieNode> Freq::BuildTrie(std::vector<char>&& aVec) const
 {
-    std::transform(aData.begin(), aData.end(), aData.begin(),
-        [](auto&& c){
-            if((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
-                return std::tolower(c);
-            else
-                return static_cast<int>(' ');
-        });
-    return aData;
-}
-//-----------------------------------------------------------------------------
-
-std::vector<std::string> Freq::ConvertToVector(std::string&& aData) const
-{
-    std::vector<std::string> vec;
-    vec.reserve(aData.size());
-
-    auto delim = ' ';
-    size_t startIdx = 0;
-    size_t endIdx = 0;
-
-    while ((startIdx = aData.find_first_not_of(delim, endIdx))!= std::string::npos)
+    auto rootNode = std::make_unique<TrieNode>(nullptr, 0, 0);
+    auto pNode = rootNode.get();
+    for (auto c : aVec)
     {
-        endIdx = aData.find(delim, startIdx);
-        vec.push_back(aData.substr(startIdx, endIdx - startIdx));
-    }
-    return vec;
-}
-//-----------------------------------------------------------------------------
-
-Freq::TokenMap Freq::CalculateTokensFreq(std::vector<std::string>&& aData) const
-{
-    // lamda function for populating the data in async task
-    auto getTokensCount = [this](auto&& first, auto&& last)
-    {
-        Freq::TokenMap res;
-        while(first != last)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
         {
-            auto count = res[*first];
-            res[*first] += 1;
-            ++first;
+            if (pNode != rootNode.get())
+            {
+                pNode->IncCount();
+            }
+            pNode = rootNode.get();
+            continue;
         }
-        return res;
-    };
 
-    const auto threadCount = 4;
-    auto tokenPerThread = aData.size() / threadCount;
-    auto tailtokens = aData.size() % threadCount;
+        pNode = pNode->AddChar(std::tolower(c));
+    }
 
-    std::vector<std::future<Freq::TokenMap>> futures;
-    auto first = aData.begin();
-    if(tokenPerThread)
+    if (pNode != rootNode.get())
     {
-        for(auto i=0; i<threadCount; ++i)
+        pNode->IncCount();
+    }
+    return rootNode;
+}
+//-----------------------------------------------------------------------------
+
+void Freq::TraceTrie(TrieNode* aNode)
+{
+    if (aNode->m_count)
+    {
+        m_wordsByCount[aNode->m_count].push_back(aNode);
+        m_counts.insert(aNode->m_count);
+    }
+
+    for (int i = 0; i < 26; ++i)
+    {
+        if (aNode->m_items[i])
         {
-            futures.push_back(std::async(std::launch::async, getTokensCount, first, first + tokenPerThread));
-            first += tokenPerThread;
+            TraceTrie(aNode->m_items[i]);
         }
     }
-    if(tailtokens)
-    {
-        futures.push_back(std::async(std::launch::async, getTokensCount, first, aData.end()));
-    }
-
-    //save data from all async tasks into the
-    Freq::TokenMap totalData;
-    for (auto&& fut : futures)
-    {
-        auto data = fut.get();
-        for(auto&& [k,v] : data)
-        {
-            auto count = totalData[k];
-            count += v;
-            totalData[k] = count;
-        }
-    }
-    return totalData;
 }
 //-----------------------------------------------------------------------------
 
-std::vector<Freq::Token> Freq::SortOutputData(TokenMap&& aData) const
-{
-    std::vector<Token> results;
-    results.reserve(aData.size());
-
-    std::transform(aData.begin(), aData.end(),
-                   std::back_inserter(results),
-                   [](auto&& p){return Token(p.first, p.second);});
-
-    std::sort(results.begin(), results.end());
-
-    return results;
-}
-//-----------------------------------------------------------------------------
-
-void Freq::WriteData(std::vector<Token>&& aData)
+void Freq::WriteTrie()
 {
     std::ofstream ofs(m_outpath.string(), std::ofstream::binary);
     if(!ofs.is_open())
         throw Error::OpenFileException(m_outpath.string());
-    for(auto&& el : aData)
+
+    std::vector<int> vecCounts(m_counts.begin(), m_counts.end());
+    std::sort(vecCounts.begin(), vecCounts.end(), std::greater<int>());
+
+    for (auto count : vecCounts)
     {
-        ofs << el.m_count<<' '<<el.m_token<<'\n';
+        for (auto iter = m_wordsByCount[count].begin(); iter != m_wordsByCount[count].end(); ++iter)
+        {
+            auto node = *iter;
+            std::string str((size_t)node->m_lenght, 0);
+            int i = node->m_lenght - 1;
+            while (i >= 0 and node->m_char)
+            {
+                str[i--] = node->m_char;
+                node = node->m_parent;
+            }
+            ofs << count <<' '<<str<<'\n';
+        }
     }
 }
 //-----------------------------------------------------------------------------
