@@ -96,7 +96,7 @@ void Freq::TraceTrie(TrieNode* aNode)
         m_counts.insert(aNode->m_count);
     }
 
-    for (int i = 0; i < 26; ++i)
+    for (int i = 0; i < ITEMS_SIZE; ++i)
     {
         if (aNode->m_items[i])
         {
